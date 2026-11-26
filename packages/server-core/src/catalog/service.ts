@@ -412,6 +412,27 @@ export async function createCollection(db: PGlite, householdId: string, name: st
   return { id, name: name.trim(), item_count: 0 };
 }
 
+/** Renames a collection; the name stays unique per household, ignoring case. */
+export async function renameCollection(db: PGlite, householdId: string, collectionId: string, name: string) {
+  const clean = name.trim();
+  let result;
+  try {
+    result = await db.query<{ id: string; name: string; sort_order: number }>(
+      `UPDATE collections SET name = $3 WHERE id = $1 AND household_id = $2 RETURNING id, name, sort_order`,
+      [collectionId, householdId, clean],
+    );
+  } catch (error) {
+    if (String(error).toLowerCase().includes("duplicate")) {
+      throw Object.assign(new Error("collection_exists"), { statusCode: 409 });
+    }
+    throw error;
+  }
+  const row = result.rows[0];
+  if (!row) throw Object.assign(new Error("collection_not_found"), { statusCode: 404 });
+  const count = await db.query<{ n: number }>(`SELECT COUNT(*)::int AS n FROM collection_members WHERE collection_id = $1`, [collectionId]);
+  return { id: row.id, name: row.name, sort_order: row.sort_order, item_count: count.rows[0]?.n ?? 0 };
+}
+
 export async function deleteCollection(db: PGlite, householdId: string, collectionId: string) {
   const result = await db.query(
     `DELETE FROM collections WHERE id = $1 AND household_id = $2`,

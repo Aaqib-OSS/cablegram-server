@@ -1,0 +1,47 @@
+name: Bug report
+description: Something in Cablegram Community Server does not work
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Server version
+      description: The version from `GET /api/server`, or the release tag or commit you run.
+    validations:
+      required: true
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Deployment
+      options: [Docker Compose, Native Node.js, Other]
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Reverse proxy, OS and architecture
+      placeholder: Caddy, Debian 12, arm64
+  - type: dropdown
+    id: app
+    attributes:
+      label: Which client?
+      options: [Android phone, Android TV, iPhone, TV web app (LG / Samsung), Web remote, None, I don't know]
+    validations:
+      required: true
+  - type: input
+    id: app-version
+    attributes:
+      label: Client app version
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+      description: Steps to reproduce help most.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Server logs
+      description: Redact all tokens, setup codes and private IDs before pasting.
+      render: shell

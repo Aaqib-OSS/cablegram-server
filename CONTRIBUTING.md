@@ -2,6 +2,8 @@
 
 Thanks for helping. Pull requests are welcome: bug fixes, tests, documentation and self-hosting improvements.
 
+Be kind. This project follows the [Code of Conduct](CODE_OF_CONDUCT.md).
+
 ## Before you open a pull request
 
 - Open an issue first for anything larger than a small fix, so we can agree on the approach.

@@ -133,6 +133,7 @@ export function registerDeviceSignInRoutes(app: FastifyInstance, db: PGlite) {
     const { householdId, userId, profileId, displayName } = await ensureCommunityHouseholdAndUser(db, body.household_name);
     const deviceId = randomUUID();
     const deviceSecret = randomSecret();
+    const hwHash = hardwareHash(body.hardware_id);
     await db.query(
       `INSERT INTO devices (id, household_id, kind, display_name, secret_hash, hardware_hash, user_id)
        VALUES ($1, $2, 'phone', $3, $4, $5, $6)`,
@@ -141,10 +142,17 @@ export function registerDeviceSignInRoutes(app: FastifyInstance, db: PGlite) {
         householdId,
         body.device_name || "Phone",
         hashToken(deviceSecret),
-        hardwareHash(body.hardware_id),
+        hwHash,
         userId,
       ],
     );
+    if (hwHash) {
+      await db.query(
+        `UPDATE devices SET revoked_at = NOW(), revoked_reason = 'replaced'
+         WHERE household_id = $1 AND kind = 'phone' AND hardware_hash = $2 AND id <> $3 AND revoked_at IS NULL`,
+        [householdId, hwHash, deviceId],
+      );
+    }
 
     const client: Client = body.client === "web" ? "web" : undefined;
     const tokens = await issueSession(db, userId, householdId, client, randomUUID(), deviceId);

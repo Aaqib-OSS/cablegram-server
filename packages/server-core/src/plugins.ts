@@ -147,6 +147,8 @@ export interface PluginContext {
   hooks: CoreHooks;
   purge: PurgeRegistry;
   requestBase(req: AvatarRequestLike): string;
+  /** For work that writes outside a request (a job finishing): tells connected TVs to refetch. */
+  live: import("./http/live.ts").LiveHub;
 }
 
 export interface CablegramPlugin {

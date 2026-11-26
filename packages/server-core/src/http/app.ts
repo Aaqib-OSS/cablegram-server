@@ -3,6 +3,7 @@ import websocket from "@fastify/websocket";
 import { createHash, randomUUID } from "node:crypto";
 import { z } from "zod";
 import type { PGlite } from "@electric-sql/pglite";
+import { captureException } from "../sentry.ts";
 import { coreConfig } from "../config.ts";
 import type {
   AvatarRequestLike,
@@ -14,6 +15,8 @@ import { registerCommandRoutes, type TvPresence } from "./commands.ts";
 import { registerTelegramRoutes } from "./telegram-routes.ts";
 import { registerCors, parseWebOrigins } from "./cors.ts";
 import { registerProfileLockRoutes } from "./profile-lock-routes.ts";
+import { createLiveHub, installLiveHooks, type LiveHub, type LiveOptions, type RouteChanges } from "./live.ts";
+import { CORE_ROUTE_CHANGES } from "./route-changes.ts";
 import { profileLanguages, registerLanguageRoutes } from "./language-routes.ts";
 import { registerDeviceSignInRoutes } from "../auth/device-sign-in.ts";
 import { refreshSession } from "../auth/sessions.ts";
@@ -55,12 +58,22 @@ import {
   schedulePurge,
 } from "../maintenance/purge.ts";
 import { registerServerRoutes } from "./server-routes.ts";
+import { acceptEmptyJsonBody } from "./empty-json-body.ts";
 
 export interface BuildCoreAppOptions {
   plugins?: CablegramPlugin[];
   webOrigins?: string[];
   edition?: "community" | "hosted";
   serverVersion?: string;
+  /** Scopes for mutating routes that only this edition registers (see route-changes.ts). */
+  routeChanges?: Record<string, RouteChanges>;
+  live?: LiveOptions;
+}
+
+declare module "fastify" {
+  interface FastifyInstance {
+    live: LiveHub;
+  }
 }
 
 export async function buildCoreApp(
@@ -69,9 +82,14 @@ export async function buildCoreApp(
 ): Promise<FastifyInstance> {
   const plugins = options.plugins ?? [];
   let tvOnline: TvPresence = () => false;
+  let tvOpenWithoutRemote: TvPresence = () => false;
   const app = Fastify({ logger: false });
   await app.register(websocket);
-  registerCors(app, options.webOrigins ?? parseWebOrigins(process.env.WEB_APP_ORIGINS));
+  const webOrigins = options.webOrigins ?? parseWebOrigins(process.env.WEB_APP_ORIGINS);
+  registerCors(app, webOrigins);
+  const live = createLiveHub(options.live);
+  app.decorate("live", live);
+  installLiveHooks(app, db, live, { ...CORE_ROUTE_CHANGES, ...options.routeChanges });
   const hooks: CoreHooks = {
     onActivity: [],
     onTvPlayback: [],
@@ -107,9 +125,10 @@ export async function buildCoreApp(
     hooks,
     purge,
     requestBase,
+    live,
   };
 
-  registerProfileLockRoutes(app, db);
+  registerProfileLockRoutes(app, db, live);
   registerLanguageRoutes(app, db);
 
   for (const plugin of plugins) {
@@ -136,6 +155,7 @@ export async function buildCoreApp(
   const stopPurge = schedulePurge(db, undefined, purgeSteps);
   app.addHook("onClose", async () => {
     stopPurge();
+    live.close();
     for (const plugin of plugins) {
       if (plugin.stop) await plugin.stop();
     }
@@ -164,6 +184,12 @@ export async function buildCoreApp(
       }
     }
     const status = (err as { statusCode?: number }).statusCode ?? 500;
+    if (status >= 500) {
+      captureException(err, {
+        url: _req.raw?.url,
+        method: _req.raw?.method,
+      });
+    }
     const extra = (err as { extra?: Record<string, unknown> }).extra;
     reply
       .code(status)
@@ -184,9 +210,47 @@ export async function buildCoreApp(
 
   app.post("/api/auth/logout", async (req, reply) => {
     const body = z.object({ refresh_token: z.string() }).parse(req.body);
-    await db.query(`UPDATE sessions SET revoked_at = NOW() WHERE refresh_token_hash = $1`, [
-      hashToken(body.refresh_token),
-    ]);
+    const revoked = await db.query<{ user_id: string | null; device_id: string | null }>(
+      `UPDATE sessions SET revoked_at = COALESCE(revoked_at, NOW())
+       WHERE refresh_token_hash = $1
+       RETURNING user_id, device_id`,
+      [hashToken(body.refresh_token)],
+    );
+    for (const row of revoked.rows) {
+      if (row.device_id) {
+        await db.query(
+          `UPDATE devices SET revoked_at = COALESCE(revoked_at, NOW()), revoked_reason = COALESCE(revoked_reason, 'logout')
+           WHERE id = $1`,
+          [row.device_id],
+        );
+        clearRevocation(row.device_id);
+      }
+      if (row.user_id) {
+        await db.query(
+          `UPDATE users u SET last_active_at = NULL
+           WHERE u.id = $1
+             AND NOT EXISTS (
+               SELECT 1 FROM sessions s
+               WHERE s.user_id = u.id AND s.revoked_at IS NULL AND s.expires_at > NOW()
+             )`,
+          [row.user_id],
+        );
+        await db.query(
+          `UPDATE households h SET last_active_at = NULL
+           WHERE h.id = (SELECT household_id FROM users WHERE id = $1)
+             AND NOT EXISTS (
+               SELECT 1 FROM sessions s JOIN users u ON u.id = s.user_id
+               WHERE u.household_id = h.id AND s.revoked_at IS NULL AND s.expires_at > NOW()
+             )
+             AND NOT EXISTS (
+               SELECT 1 FROM devices d
+               WHERE d.household_id = h.id AND d.revoked_at IS NULL
+                 AND (d.trust_expires_at IS NULL OR d.trust_expires_at > NOW())
+             )`,
+          [row.user_id],
+        );
+      }
+    }
     return reply.code(204).send();
   });
 
@@ -271,7 +335,11 @@ export async function buildCoreApp(
         : undefined;
     return {
       household,
-      devices: devices.rows.map((d) => (d.kind === "tv" ? { ...d, online: tvOnline(d.id) } : d)),
+      devices: devices.rows.map((d) =>
+        d.kind === "tv"
+          ? { ...d, online: tvOnline(d.id), ...(tvOpenWithoutRemote(d.id) ? { remote_control: false } : {}) }
+          : d,
+      ),
       scope: auth.scope,
       profile_languages: await profileLanguages(db, auth.household_id),
       ...(legal ? { legal } : {}),
@@ -637,6 +705,28 @@ export async function buildCoreApp(
     return { ok: true };
   });
 
+  async function replacePhoneHardware(householdId: string, deviceId: string, hash: string | null) {
+    if (!hash) return;
+    const replaced = await db.query<{ id: string }>(
+      `UPDATE devices SET revoked_at = NOW(), revoked_reason = 'replaced'
+       WHERE household_id = $1 AND kind = 'phone' AND hardware_hash = $2 AND id <> $3 AND revoked_at IS NULL
+       RETURNING id`,
+      [householdId, hash, deviceId],
+    );
+    if (replaced.rows.length > 0) {
+      const replacedIds = replaced.rows.map((row) => row.id);
+      await db.query(
+        `UPDATE media_sources SET serving_device_id = $1 WHERE household_id = $2 AND serving_device_id = ANY($3::uuid[])`,
+        [deviceId, householdId, replacedIds],
+      );
+      await db.query(
+        `UPDATE telegram_links SET linked_by_device_id = $1 WHERE household_id = $2 AND linked_by_device_id = ANY($3::uuid[])`,
+        [deviceId, householdId, replacedIds],
+      );
+      for (const oldId of replacedIds) clearRevocation(oldId);
+    }
+  }
+
   app.patch("/api/devices/:deviceId", async (req) => {
     const auth = await requireAuth(req);
     const { deviceId } = req.params as { deviceId: string };
@@ -661,8 +751,8 @@ export async function buildCoreApp(
     ) {
       throw Object.assign(new Error("forbidden"), { statusCode: 403 });
     }
-    const r = await db.query<{ household_id: string }>(
-      `SELECT household_id FROM devices WHERE id = $1`,
+    const r = await db.query<{ household_id: string; kind: string }>(
+      `SELECT household_id, kind FROM devices WHERE id = $1`,
       [deviceId],
     );
     if (!r.rows[0] || r.rows[0].household_id !== auth.household_id) {
@@ -674,6 +764,9 @@ export async function buildCoreApp(
         `UPDATE devices SET hardware_hash = COALESCE(hardware_hash, $1) WHERE id = $2`,
         [hash, deviceId],
       );
+      if (r.rows[0].kind === "phone") {
+        await replacePhoneHardware(auth.household_id, deviceId, hash);
+      }
       if (auth.scope === "phone") {
         for (const fn of hooks.onPhoneHardwareSeen) {
           await fn(db, hash, auth.household_id);
@@ -695,20 +788,53 @@ export async function buildCoreApp(
     return { ok: true };
   });
 
-  app.delete("/api/devices/:deviceId", async (req, reply) => {
-    const auth = await requireAuth(req);
-    const params = req.params as { deviceId: string };
-    const tvSelf =
-      auth.scope === "tv" && (params.deviceId === "self" || params.deviceId === auth.device_id);
-    if (auth.scope !== "phone" && !tvSelf)
-      throw Object.assign(new Error("forbidden"), { statusCode: 403 });
-    const deviceId = tvSelf && auth.scope === "tv" ? auth.device_id : params.deviceId;
-    await db.query(
-      `UPDATE devices SET revoked_at = NOW() WHERE id = $1 AND household_id = $2`,
-      [deviceId, auth.household_id],
-    );
-    clearRevocation(deviceId);
-    return reply.code(204).send();
+  // TVs unpair with DELETE /api/devices/self, content-type application/json and no body. The strict parser answered
+  // 400 before the route ran, so the TV forgot its token while its device and session stayed active.
+  app.register(async (scope) => {
+    acceptEmptyJsonBody(scope);
+    scope.delete("/api/devices/:deviceId", async (req, reply) => {
+      const auth = await requireAuth(req, { recordActivity: false });
+      const params = req.params as { deviceId: string };
+      const tvSelf =
+        auth.scope === "tv" && (params.deviceId === "self" || params.deviceId === auth.device_id);
+      if (auth.scope !== "phone" && !tvSelf)
+        throw Object.assign(new Error("forbidden"), { statusCode: 403 });
+      const deviceId = tvSelf && auth.scope === "tv" ? auth.device_id : params.deviceId;
+      await db.query(
+        `UPDATE devices
+         SET revoked_at = COALESCE(revoked_at, NOW()),
+             revoked_reason = COALESCE(revoked_reason, 'unpaired')
+         WHERE id = $1 AND household_id = $2`,
+        [deviceId, auth.household_id],
+      );
+      await db.query(
+        `UPDATE sessions SET revoked_at = COALESCE(revoked_at, NOW())
+         WHERE device_id = $1 AND revoked_at IS NULL`,
+        [deviceId],
+      );
+      await db.query(
+        `UPDATE households h SET last_active_at = NULL
+         WHERE h.id = $1
+           AND NOT EXISTS (
+             SELECT 1 FROM devices d
+             WHERE d.household_id = h.id AND d.revoked_at IS NULL
+               AND (d.trust_expires_at IS NULL OR d.trust_expires_at > NOW())
+           )`,
+        [auth.household_id],
+      );
+      await db.query(
+        `UPDATE users u SET last_active_at = NULL
+         WHERE u.household_id = $1
+           AND NOT EXISTS (
+             SELECT 1 FROM devices d
+             WHERE d.household_id = u.household_id AND d.revoked_at IS NULL
+               AND (d.trust_expires_at IS NULL OR d.trust_expires_at > NOW())
+           )`,
+        [auth.household_id],
+      );
+      clearRevocation(deviceId);
+      return reply.code(204).send();
+    });
   });
 
   app.post("/api/devices/phone", async (req, reply) => {
@@ -725,6 +851,7 @@ export async function buildCoreApp(
       `INSERT INTO devices (id, household_id, kind, display_name, secret_hash, hardware_hash, user_id) VALUES ($1, $2, 'phone', 'Phone', $3, $4, $5)`,
       [id, auth.household_id, hashToken(secret), hash, auth.user_id],
     );
+    await replacePhoneHardware(auth.household_id, id, hash);
     for (const fn of hooks.onPhoneHardwareSeen) {
       await fn(db, hash, auth.household_id);
     }
@@ -784,6 +911,13 @@ export async function buildCoreApp(
     const auth = await requireAuth(req);
     const body = z.object({ name: z.string().trim().min(1).max(100) }).parse(req.body);
     return reply.code(201).send(await catalog.createCollection(db, auth.household_id, body.name));
+  });
+
+  app.patch("/api/catalog/collections/:collectionId", async (req) => {
+    const auth = await requireAuth(req);
+    const { collectionId } = req.params as { collectionId: string };
+    const body = z.object({ name: z.string().trim().min(1).max(100) }).strict().parse(req.body);
+    return catalog.renameCollection(db, auth.household_id, collectionId, body.name);
   });
 
   app.delete("/api/catalog/collections/:collectionId", async (req, reply) => {
@@ -1107,7 +1241,7 @@ export async function buildCoreApp(
     return { ok: true };
   });
 
-  tvOnline = registerCommandRoutes(app, db);
+  ({ online: tvOnline, openWithoutRemote: tvOpenWithoutRemote } = registerCommandRoutes(app, db, live, webOrigins));
   registerTelegramRoutes(app, db);
 
   if (coreConfig.requireTls) {

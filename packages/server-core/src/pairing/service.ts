@@ -3,6 +3,8 @@ import type { PGlite } from "@electric-sql/pglite";
 import { hashToken, pinLookup, randomPin, randomSecret } from "../auth/secrets.ts";
 import { checkPinRate, clearPinFail, recordPinFail } from "./pin-rate-limit.ts";
 
+type PendingSession = { id: string; status: string; expires_at: string; device_name: string | null; hardware_hash: string | null };
+
 export async function startPairing(db: PGlite, deviceName?: string, hardwareHash?: string | null) {
   const id = randomUUID();
   const pin = randomPin();
@@ -50,7 +52,7 @@ export async function claimPin(
 ) {
   checkPinRate(householdId);
   const lookup = pinLookup(pin);
-  const r = await db.query<{ id: string; status: string; expires_at: string; device_name: string | null; hardware_hash: string | null }>(
+  const r = await db.query<PendingSession>(
     `SELECT id, status, expires_at, device_name, hardware_hash FROM pairing_sessions WHERE pin_lookup = $1 AND status = 'pending'`,
     [lookup],
   );
@@ -60,6 +62,26 @@ export async function claimPin(
     throw Object.assign(new Error(row ? "pin_expired" : "invalid_pin"), { statusCode: 400 });
   }
   clearPinFail(householdId);
+  return finishClaim(db, householdId, row, tvDisplayName);
+}
+
+/**
+ * Claims the session a TV is waiting on, proved by that TV's own pairing token instead of a PIN read from its screen.
+ * The TV's usual polling then finds it paired. Store review only (plans/reviewer-access.md).
+ */
+export async function claimOwnSession(db: PGlite, householdId: string, sessionId: string, tvDisplayName: string) {
+  const r = await db.query<PendingSession>(
+    `SELECT id, status, expires_at, device_name, hardware_hash FROM pairing_sessions WHERE id = $1 AND status = 'pending'`,
+    [sessionId],
+  );
+  const row = r.rows[0];
+  if (!row || new Date(row.expires_at) < new Date()) {
+    throw Object.assign(new Error("pin_expired"), { statusCode: 400 });
+  }
+  return finishClaim(db, householdId, row, tvDisplayName);
+}
+
+async function finishClaim(db: PGlite, householdId: string, row: PendingSession, tvDisplayName: string) {
   const deviceId = randomUUID();
   const lanCapability = randomSecret();
   await db.query(

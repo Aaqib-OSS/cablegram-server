@@ -55,7 +55,17 @@ async function phoneUserHousehold(userId: string): Promise<string | null> {
   return householdId;
 }
 
-export async function requireAuth(req: FastifyRequest): Promise<PhoneClaims | TvClaims> {
+const authenticated = new WeakMap<FastifyRequest, PhoneClaims | TvClaims>();
+
+/** Who `requireAuth` accepted for this request, for hooks that run after the handler. */
+export function authOf(req: FastifyRequest): PhoneClaims | TvClaims | undefined {
+  return authenticated.get(req);
+}
+
+export async function requireAuth(
+  req: FastifyRequest,
+  options?: { recordActivity?: boolean },
+): Promise<PhoneClaims | TvClaims> {
   const h = req.headers.authorization;
   if (!h?.startsWith("Bearer ")) {
     throw Object.assign(new Error("unauthorized"), { statusCode: 401 });
@@ -73,9 +83,10 @@ export async function requireAuth(req: FastifyRequest): Promise<PhoneClaims | Tv
     throw Object.assign(new Error("unauthorized"), { statusCode: 401 });
   }
   const holder = coreConfig as DbHolder;
-  if (holder.db && holder.onActivity) {
+  if (holder.db && holder.onActivity && options?.recordActivity !== false) {
     await holder.onActivity(holder.db, claims.household_id, claims.scope === "phone" ? claims.user_id : undefined);
   }
+  authenticated.set(req, claims);
   return claims;
 }
 

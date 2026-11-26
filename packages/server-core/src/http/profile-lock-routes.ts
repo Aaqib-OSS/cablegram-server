@@ -3,6 +3,7 @@ import type { PGlite } from "@electric-sql/pglite";
 import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { requireAuth } from "./authorize.ts";
+import type { LiveHub } from "./live.ts";
 
 const PENDING_SECONDS = 120;
 
@@ -19,7 +20,7 @@ export async function isSharedTv(db: PGlite, tvDeviceId: string): Promise<boolea
   return r.rows.length > 0;
 }
 
-export function registerProfileLockRoutes(app: FastifyInstance, db: PGlite) {
+export function registerProfileLockRoutes(app: FastifyInstance, db: PGlite, live?: LiveHub) {
   app.post("/api/profiles/switch-requests", async (req, reply) => {
     const auth = await requireAuth(req);
     const body = z
@@ -54,6 +55,10 @@ export function registerProfileLockRoutes(app: FastifyInstance, db: PGlite) {
          CASE WHEN $6 = 'approved' THEN NOW() END)`,
       [id, auth.household_id, body.profileId, body.deviceName ?? null, tvDeviceId, status, PENDING_SECONDS],
     );
+    // A request nobody answers expires lazily on read; tell the waiting TV when that happens.
+    if (status === "pending" && tvDeviceId) {
+      live?.notifyChangedIn((PENDING_SECONDS + 1) * 1000, auth.household_id, "profileSwitch", { deviceId: tvDeviceId });
+    }
     return reply.code(202).send({ requestId: id, status, profileName: row.name, shared });
   });
 

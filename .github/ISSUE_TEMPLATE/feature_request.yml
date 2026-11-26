@@ -1,0 +1,24 @@
+name: Feature request
+description: Suggest a change to Cablegram Community Server
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What do you want to do that you can't today?
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would you change?
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+  - type: markdown
+    attributes:
+      value: |
+        Cablegram Community Server deliberately leaves out proprietary server-side enrichment, AI title
+        resolution and external media processing, to stay small, independent and secure. Requests for the
+        private hosted services will be closed.

@@ -6,6 +6,8 @@ import { isDeepStrictEqual } from "node:util";
 import { z } from "zod";
 import { requireAuth } from "./authorize.ts";
 import type { TvClaims } from "../auth/jwt.ts";
+import { socketOriginAllowed, type LiveHub } from "./live.ts";
+import { acceptEmptyJsonBody } from "./empty-json-body.ts";
 
 type CommandRow = { id: string; command: string; payload: string | Record<string, unknown> | null; expires_at: Date | string };
 const resultSchema = z.discriminatedUnion("type", [
@@ -27,12 +29,26 @@ const POLLED_ONLINE_MS = 15_000;
 /** Whether a TV can take a command now: its command socket is open, or it polled recently. */
 export type TvPresence = (deviceId: string) => boolean;
 
-export function registerCommandRoutes(app: FastifyInstance, db: PGlite): TvPresence {
+export interface TvPresenceChecks {
+  online: TvPresence;
+  /**
+   * Cablegram is open on the TV but it takes no remote commands: tv-web (browser, LG, Samsung) holds only a hints socket.
+   * The phone then says to choose the film on the TV instead of "isn't on".
+   */
+  openWithoutRemote: TvPresence;
+}
+
+export function registerCommandRoutes(app: FastifyInstance, db: PGlite, live: LiveHub, webOrigins: readonly string[] = []): TvPresenceChecks {
   const sockets = new Map<string, { socket: WebSocket; pump: () => Promise<void> }>();
   const polledAt = new Map<string, number>();
+  /** Open hints-only sockets per TV (a TV can have several tabs or a reconnect overlapping the old socket). */
+  const hintSockets = new Map<string, number>();
+
+  /** Sockets opened with a single-use ticket (browsers cannot set an Authorization header on a WebSocket). */
+  const ticketed = new WeakMap<FastifyRequest, TvClaims>();
 
   async function tvAuth(req: FastifyRequest): Promise<TvClaims> {
-    const auth = await requireAuth(req);
+    const auth = ticketed.get(req) ?? await requireAuth(req);
     if (auth.scope !== "tv") throw Object.assign(new Error("forbidden"), { statusCode: 403 });
     // Check existence and revocation against this app's DB, including on an
     // already-open connection. The HTTP auth cache alone is insufficient here.
@@ -108,12 +124,25 @@ export function registerCommandRoutes(app: FastifyInstance, db: PGlite): TvPrese
   ) => void;
   socketRoute("/api/control/commands/socket", {
     websocket: true,
-    preValidation: async (req) => { await tvAuth(req); },
+    preValidation: async (req) => {
+      const ticket = (req.query as { ticket?: unknown }).ticket;
+      if (!req.headers.authorization && typeof ticket === "string") {
+        // The ticket is the credential; Origin is a second check so another website cannot reuse one.
+        if (!socketOriginAllowed(req.headers.origin, webOrigins)) throw Object.assign(new Error("origin_not_allowed"), { statusCode: 403 });
+        const redeemed = live.redeemTicket(ticket);
+        if (!redeemed) throw Object.assign(new Error("unauthorized"), { statusCode: 401 });
+        ticketed.set(req, { scope: "tv", sub: redeemed.deviceId, household_id: redeemed.householdId, device_id: redeemed.deviceId });
+      }
+      await tvAuth(req);
+    },
   }, (socket, req) => {
     let closed = false;
     let deviceId: string | undefined;
     let pumping = false;
     let pumpAgain = false;
+    // A ticket socket comes from tv-web, which does not run remote commands yet: it only receives live-sync hints.
+    // It never claims commands and never makes the TV look online for the phone's remote.
+    const hintsOnly = ticketed.has(req);
     const authPromise = tvAuth(req);
     const pump = async () => {
       if (closed) return;
@@ -124,7 +153,7 @@ export function registerCommandRoutes(app: FastifyInstance, db: PGlite): TvPrese
         await tvAuth(req);
         do {
           pumpAgain = false;
-          if (closed || socket.readyState !== socket.OPEN) return;
+          if (closed || socket.readyState !== socket.OPEN || hintsOnly) return;
           for (const row of await claim(auth, true)) {
             if (closed || socket.readyState !== socket.OPEN) break;
             socket.send(JSON.stringify({ type: "command", command: wire(row) }));
@@ -137,14 +166,22 @@ export function registerCommandRoutes(app: FastifyInstance, db: PGlite): TvPrese
     const timer = setInterval(() => { void pump(); }, 1_000);
     timer.unref();
     // Install listeners synchronously, before authentication/database awaits.
+    let detach = () => {};
+    let countedHint = false;
     socket.on("close", () => {
       closed = true;
       clearInterval(timer);
+      detach();
       if (deviceId && sockets.get(deviceId)?.socket === socket) sockets.delete(deviceId);
+      if (deviceId && countedHint) {
+        const left = (hintSockets.get(deviceId) ?? 1) - 1;
+        if (left > 0) hintSockets.set(deviceId, left); else hintSockets.delete(deviceId);
+      }
     });
     let messages = Promise.resolve();
     socket.on("message", (raw: Buffer) => {
       messages = messages.then(async () => {
+        if (hintsOnly) { socket.close(1008, "hints_only"); return; }
         const parsed = resultSchema.safeParse(JSON.parse(raw.toString()));
         if (!parsed.success) { socket.close(1008, "invalid_result"); return; }
         const auth = await tvAuth(req);
@@ -156,11 +193,24 @@ export function registerCommandRoutes(app: FastifyInstance, db: PGlite): TvPrese
     void authPromise.then(async (auth) => {
       if (closed) return;
       deviceId = auth.device_id;
-      sockets.get(deviceId)?.socket.close(1000, "replaced");
-      sockets.set(deviceId, { socket, pump });
+      if (!hintsOnly) {
+        sockets.get(deviceId)?.socket.close(1000, "replaced");
+        sockets.set(deviceId, { socket, pump });
+      } else {
+        hintSockets.set(deviceId, (hintSockets.get(deviceId) ?? 0) + 1);
+        countedHint = true;
+      }
+      detach = live.attach(auth.household_id, deviceId, (text) => { if (socket.readyState === socket.OPEN) socket.send(text); });
       socket.send(JSON.stringify({ type: "ready" }));
       await pump();
     }).catch(() => socket.close(1008, "unauthorized"));
+  });
+
+  // A browser TV asks for this over REST (with its bearer token), then opens the socket with `?ticket=`.
+  app.post("/api/control/commands/socket-ticket", async (req, reply) => {
+    const auth = await tvAuth(req);
+    const { ticket, expiresInMs } = live.issueTicket(auth.device_id, auth.household_id);
+    return reply.code(200).send({ ticket, expires_in_ms: expiresInMs });
   });
 
   app.post("/api/control/commands", async (req, reply) => {
@@ -254,10 +304,7 @@ export function registerCommandRoutes(app: FastifyInstance, db: PGlite): TvPrese
   // TVs already installed send this with content-type application/json and no body, which Fastify rejects with a 400.
   // The route carries no body, so its own scope accepts an empty one; every other route keeps the strict JSON parser.
   app.register(async (scope) => {
-    scope.addContentTypeParser("application/json", { parseAs: "string" }, (_req, body, done) => {
-      if (body === "") return done(null, {});
-      try { done(null, JSON.parse(body as string)); } catch { done(Object.assign(new Error("invalid_json"), { statusCode: 400 })); }
-    });
+    acceptEmptyJsonBody(scope);
     scope.post("/api/control/commands/:commandId/complete", async (req, reply) => {
       const auth = await tvAuth(req);
       await finish(auth, { type: "complete", id: z.string().uuid().parse((req.params as { commandId: string }).commandId) });
@@ -282,6 +329,8 @@ export function registerCommandRoutes(app: FastifyInstance, db: PGlite): TvPrese
     video_id: z.string().min(1).max(200).nullable().optional(),
     origin_id: z.string().min(1).max(200).nullable().optional(),
     position_ms: z.number().int().min(0).max(1e10).optional(),
+    // The TV's own volume (0-100), so the phone's slider can start from it.
+    volume: z.number().int().min(0).max(100).optional(),
     // Increases with every report from one TV, so a report that arrives late cannot replace a newer one.
     seq: z.number().int().min(0),
   });
@@ -314,10 +363,13 @@ export function registerCommandRoutes(app: FastifyInstance, db: PGlite): TvPrese
       video_id: known?.video_id ?? null,
       origin_id: known?.origin_id ?? null,
       position_ms: known?.position_ms ?? null,
+      volume: known?.volume ?? null,
       // Relative, so a phone with a skewed clock can still tell how fresh the report is.
       age_ms: known ? Date.now() - known.updated_at_ms : null,
     };
   });
 
-  return online;
+  const openWithoutRemote: TvPresence = (deviceId) => !online(deviceId) && (hintSockets.get(deviceId) ?? 0) > 0;
+
+  return { online, openWithoutRemote };
 }
