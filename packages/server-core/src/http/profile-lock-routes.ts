@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { requireAuth } from "./authorize.ts";
 import type { LiveHub } from "./live.ts";
+import type { CoreHooks } from "../plugins.ts";
 
 const PENDING_SECONDS = 120;
 
@@ -20,7 +21,7 @@ export async function isSharedTv(db: PGlite, tvDeviceId: string): Promise<boolea
   return r.rows.length > 0;
 }
 
-export function registerProfileLockRoutes(app: FastifyInstance, db: PGlite, live?: LiveHub) {
+export function registerProfileLockRoutes(app: FastifyInstance, db: PGlite, live?: LiveHub, hooks?: CoreHooks) {
   app.post("/api/profiles/switch-requests", async (req, reply) => {
     const auth = await requireAuth(req);
     const body = z
@@ -39,7 +40,8 @@ export function registerProfileLockRoutes(app: FastifyInstance, db: PGlite, live
     if (!row) throw Object.assign(new Error("profile_not_found"), { statusCode: 404 });
     const tvDeviceId = auth.scope === "tv" ? auth.device_id : null;
     const shared = tvDeviceId ? await isSharedTv(db, tvDeviceId) : false;
-    const status = tvDeviceId && (row.profile_lock || shared) && !row.pin_set ? "pending" : "approved";
+    const forced = tvDeviceId && hooks?.isTvProfileLockForced ? await hooks.isTvProfileLockForced(db, tvDeviceId) : false;
+    const status = tvDeviceId && (row.profile_lock || shared || forced) && !row.pin_set ? "pending" : "approved";
     if (tvDeviceId) {
       await db.query(
         `UPDATE profile_switch_requests SET status = 'expired', resolved_at = NOW()
@@ -55,11 +57,32 @@ export function registerProfileLockRoutes(app: FastifyInstance, db: PGlite, live
          CASE WHEN $6 = 'approved' THEN NOW() END)`,
       [id, auth.household_id, body.profileId, body.deviceName ?? null, tvDeviceId, status, PENDING_SECONDS],
     );
+    let extra: { bot_blocked?: boolean } | void = undefined;
+    if (tvDeviceId && hooks?.onProfileSwitchCreated) {
+      let tvName = body.deviceName ?? null;
+      const dev = await db.query<{ display_name: string | null }>(`SELECT display_name FROM devices WHERE id = $1`, [tvDeviceId]);
+      if (dev.rows[0]?.display_name) tvName = dev.rows[0].display_name;
+      extra = await hooks.onProfileSwitchCreated(db, {
+        requestId: id,
+        householdId: auth.household_id,
+        profileId: body.profileId,
+        profileName: row.name,
+        tvDeviceId,
+        tvName,
+        status,
+      });
+    }
     // A request nobody answers expires lazily on read; tell the waiting TV when that happens.
     if (status === "pending" && tvDeviceId) {
       live?.notifyChangedIn((PENDING_SECONDS + 1) * 1000, auth.household_id, "profileSwitch", { deviceId: tvDeviceId });
     }
-    return reply.code(202).send({ requestId: id, status, profileName: row.name, shared });
+    return reply.code(202).send({
+      requestId: id,
+      status,
+      profileName: row.name,
+      shared,
+      ...(extra?.bot_blocked ? { bot_blocked: true } : {}),
+    });
   });
 
   app.get("/api/profiles/switch-requests/pending", async (req) => {
@@ -102,6 +125,9 @@ export function registerProfileLockRoutes(app: FastifyInstance, db: PGlite, live
     );
     const row = r.rows[0];
     if (!row) throw Object.assign(new Error("switch_request_not_found"), { statusCode: 404 });
+    if (row.status === "expired") {
+      await hooks?.onProfileSwitchResolved?.(db, row.id, "expired");
+    }
     return { requestId: row.id, status: row.status, expiresAt: row.expires_at, profileName: row.profile_name };
   });
 
@@ -116,6 +142,7 @@ export function registerProfileLockRoutes(app: FastifyInstance, db: PGlite, live
       [requestId, auth.household_id, status],
     );
     if (!r.rows[0]) throw Object.assign(new Error("switch_request_not_pending"), { statusCode: 409 });
+    await hooks?.onProfileSwitchResolved?.(db, requestId, status);
     return { ok: true, status };
   }
 

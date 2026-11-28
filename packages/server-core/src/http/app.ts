@@ -128,7 +128,7 @@ export async function buildCoreApp(
     live,
   };
 
-  registerProfileLockRoutes(app, db, live);
+  registerProfileLockRoutes(app, db, live, hooks);
   registerLanguageRoutes(app, db);
 
   for (const plugin of plugins) {
@@ -333,7 +333,7 @@ export async function buildCoreApp(
       auth.scope === "phone" && hooks.legalStatus
         ? await hooks.legalStatus(db, auth.user_id)
         : undefined;
-    return {
+    const result: Record<string, unknown> = {
       household,
       devices: devices.rows.map((d) =>
         d.kind === "tv"
@@ -344,6 +344,8 @@ export async function buildCoreApp(
       profile_languages: await profileLanguages(db, auth.household_id),
       ...(legal ? { legal } : {}),
     };
+    if (hooks.meDecorator) await hooks.meDecorator(db, auth, result);
+    return result;
   });
 
   app.post("/api/account/name", async (req) => {

@@ -132,6 +132,21 @@ export interface CoreHooks {
   errorMappers: Array<(err: unknown) => { statusCode: number; body: Record<string, unknown> } | null>;
   authDescriptor?: () => ServerAuthDescriptor;
   legalDescriptor?: () => ServerLegalDescriptor | null;
+  meDecorator?: (db: PGlite, auth: PhoneClaims | TvClaims, result: Record<string, unknown>) => Promise<void> | void;
+  isTvProfileLockForced?: (db: PGlite, tvDeviceId: string) => Promise<boolean>;
+  onProfileSwitchCreated?: (
+    db: PGlite,
+    info: {
+      requestId: string;
+      householdId: string;
+      profileId: string;
+      profileName: string;
+      tvDeviceId: string;
+      tvName: string | null;
+      status: "pending" | "approved";
+    },
+  ) => Promise<{ bot_blocked?: boolean } | void>;
+  onProfileSwitchResolved?: (db: PGlite, requestId: string, status: "approved" | "denied" | "expired") => Promise<void>;
 }
 
 export interface PurgeRegistry {
